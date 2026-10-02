@@ -1,0 +1,295 @@
+import os
+from datetime import datetime
+from flask import (
+    Flask, render_template_string, request, 
+    redirect, url_for, flash, jsonify
+)
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import (
+    LoginManager, UserMixin, login_user, 
+    login_required, logout_user, current_user
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "fitbuddy-dev-secret-key-9988")
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///fitbuddy_v2.db"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
+
+# --- Database Models ---
+
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(250), nullable=False)
+    workouts = db.relationship('Workout', backref='owner', lazy=True)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+class Workout(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    exercise = db.Column(db.String(100), nullable=False)
+    duration_mins = db.Column(db.Integer, nullable=False)
+    calories_burned = db.Column(db.Integer, nullable=False)
+    date = db.Column(db.Date, nullable=False, default=datetime.utcnow().date)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# --- Single HTML Template Engine ---
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>FitBuddy App</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; }
+        .container { max-width: 850px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        .nav { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; border-bottom: 2px solid #eee; padding-bottom: 15px; }
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 25px; }
+        .card { background: #f8fafc; border: 1px solid #e2e8f0; padding: 20px; border-radius: 8px; text-align: center; }
+        .card h4 { margin: 0; color: #64748b; font-size: 14px; text-transform: uppercase; }
+        .card p { margin: 10px 0 0 0; font-size: 26px; font-weight: bold; color: #0284c7; }
+        form.grid { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 10px; margin-bottom: 30px; }
+        input { padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; }
+        button { background: #0284c7; color: white; border: none; padding: 10px 18px; border-radius: 6px; font-weight: 600; cursor: pointer; }
+        button:hover { background: #0369a1; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #e2e8f0; }
+        th { background: #f8fafc; color: #475569; }
+        .btn-del { color: #ef4444; text-decoration: none; font-weight: bold; }
+        .auth-box { max-width: 350px; margin: 50px auto; padding: 25px; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .auth-box form { display: flex; flex-direction: column; gap: 12px; }
+        .flash { color: #dc2626; background: #fee2e2; padding: 10px; border-radius: 6px; margin-bottom: 15px; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
+                {% for message in messages %}
+                    <div class="flash">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {% if current_user.is_authenticated %}
+            <div class="nav">
+                <h2>🏋️ FitBuddy Tracker</h2>
+                <div>
+                    <span>Welcome, <strong>{{ current_user.username }}</strong>!</span> | 
+                    <a href="{{ url_for('logout') }}">Logout</a>
+                </div>
+            </div>
+
+            <div class="stats">
+                <div class="card">
+                    <h4>Total Workouts</h4>
+                    <p>{{ total_workouts }}</p>
+                </div>
+                <div class="card">
+                    <h4>Active Time</h4>
+                    <p>{{ total_duration }} mins</p>
+                </div>
+                <div class="card">
+                    <h4>Calories Burned</h4>
+                    <p>{{ total_calories }} kcal</p>
+                </div>
+            </div>
+
+            <h3>Log Workout</h3>
+            <form action="{{ url_for('add_workout') }}" method="POST" class="grid">
+                <input type="text" name="exercise" placeholder="Exercise name" required>
+                <input type="number" name="duration" placeholder="Mins" min="1" required>
+                <input type="number" name="calories" placeholder="Calories" min="0" required>
+                <button type="submit">Add Activity</button>
+            </form>
+
+            <h3>Activity History</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Exercise</th>
+                        <th>Duration</th>
+                        <th>Calories</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for workout in workouts %}
+                    <tr>
+                        <td>{{ workout.date.strftime('%Y-%m-%d') }}</td>
+                        <td>{{ workout.exercise }}</td>
+                        <td>{{ workout.duration_mins }} mins</td>
+                        <td>{{ workout.calories_burned }} kcal</td>
+                        <td><a href="{{ url_for('delete_workout', id=workout.id) }}" class="btn-del">Remove</a></td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="5" style="text-align: center; color: #94a3b8;">No workouts recorded yet.</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+
+        {% else %}
+            <div class="auth-box">
+                <h2 style="text-align: center;">FitBuddy</h2>
+                {% if page == 'login' %}
+                    <h3>Login</h3>
+                    <form action="{{ url_for('login') }}" method="POST">
+                        <input type="text" name="username" placeholder="Username" required>
+                        <input type="password" name="password" placeholder="Password" required>
+                        <button type="submit">Sign In</button>
+                    </form>
+                    <p style="text-align: center; font-size: 14px; margin-top: 15px;">
+                        Need an account? <a href="{{ url_for('register') }}">Register here</a>
+                    </p>
+                {% else %}
+                    <h3>Register</h3>
+                    <form action="{{ url_for('register') }}" method="POST">
+                        <input type="text" name="username" placeholder="Choose Username" required>
+                        <input type="password" name="password" placeholder="Choose Password" required>
+                        <button type="submit">Create Account</button>
+                    </form>
+                    <p style="text-align: center; font-size: 14px; margin-top: 15px;">
+                        Already registered? <a href="{{ url_for('login') }}">Login here</a>
+                    </p>
+                {% endif %}
+            </div>
+        {% endif %}
+    </div>
+</body>
+</html>
+"""
+
+# --- Application Routes ---
+
+@app.route("/")
+@login_required
+def dashboard():
+    user_workouts = Workout.query.filter_by(user_id=current_user.id).order_by(Workout.date.desc()).all()
+    
+    total_workouts = len(user_workouts)
+    total_duration = sum(w.duration_mins for w in user_workouts)
+    total_calories = sum(w.calories_burned for w in user_workouts)
+
+    return render_template_string(
+        HTML_TEMPLATE,
+        page="dashboard",
+        workouts=user_workouts,
+        total_workouts=total_workouts,
+        total_duration=total_duration,
+        total_calories=total_calories
+    )
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+        
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+
+        if User.query.filter_by(username=username).first():
+            flash("Username already exists.")
+            return redirect(url_for("register"))
+
+        new_user = User(username=username)
+        new_user.set_password(password)
+        db.session.add(new_user)
+        db.session.commit()
+        
+        login_user(new_user)
+        return redirect(url_for("dashboard"))
+
+    return render_template_string(HTML_TEMPLATE, page="register")
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+        user = User.query.filter_by(username=username).first()
+
+        if user and user.check_password(password):
+            login_user(user)
+            return redirect(url_for("dashboard"))
+            
+        flash("Invalid username or password.")
+
+    return render_template_string(HTML_TEMPLATE, page="login")
+
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
+
+@app.route("/add", methods=["POST"])
+@login_required
+def add_workout():
+    exercise = request.form.get("exercise")
+    duration = request.form.get("duration")
+    calories = request.form.get("calories")
+
+    if exercise and duration and calories:
+        workout = Workout(
+            exercise=exercise,
+            duration_mins=int(duration),
+            calories_burned=int(calories),
+            user_id=current_user.id
+        )
+        db.session.add(workout)
+        db.session.commit()
+
+    return redirect(url_for("dashboard"))
+
+@app.route("/delete/<int:id>")
+@login_required
+def delete_workout(id):
+    workout = Workout.query.get_or_404(id)
+    if workout.user_id == current_user.id:
+        db.session.delete(workout)
+        db.session.commit()
+    return redirect(url_for("dashboard"))
+
+# --- JSON API Route ---
+
+@app.route("/api/workouts", methods=["GET"])
+@login_required
+def get_workouts_api():
+    user_workouts = Workout.query.filter_by(user_id=current_user.id).all()
+    data = [
+        {
+            "id": w.id,
+            "exercise": w.exercise,
+            "duration_mins": w.duration_mins,
+            "calories_burned": w.calories_burned,
+            "date": w.date.strftime("%Y-%m-%d")
+        }
+        for w in user_workouts
+    ]
+    return jsonify({"workouts": data})
+
+if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
